@@ -31,18 +31,6 @@ class Stock:
         else:
             raise ValueError(f"{symbol} 不在上市或上櫃清單中。")
 
-    def _is_breakout_and_pullback(self, series: pd.Series, lookback: int) -> bool:
-        # 只取最後 lookback 筆
-        recent = series.iloc[-lookback:]
-        arr = recent.values         # numpy array of floats
-        trough_pos = arr.argmin()   # 回傳最低點的相對位置 (0-based)
-        # 在 trough 之後的子陣列中找最高點
-        peak_rel = arr[trough_pos:].argmax()
-        peak_pos = trough_pos + peak_rel
-        last_pos = len(arr) - 1
-        # 檢查  trough_pos < peak_pos < last_pos
-        return (0 <= trough_pos < peak_pos < last_pos)
-
     def get_monthly_selection(self,
                               symbol: str
                               ) -> pd.Series:
@@ -81,14 +69,13 @@ class Stock:
     def get_weekly_selection(self,
                              symbol: str,
                              lookback_weeks: int = 20,
-                             pct_threshold: float = 0.05
+                             pct_threshold: float = 0.03
                             ) -> pd.Series:
         """
         週線篩選：
         • 計算每週（週五收盤）的 MA5／MA20／MA60
-        • 檢查最近 lookback_weeks 週內收盤價位於最高最低區間內
-        • 檢查「先最低→再最高→再當前」的突破拉回模式
-        • 檢查均線糾纏（差距小於 pct_threshold）
+        • 檢查先低點→再高點→現在收盤價在高低點之間的突破拉回模式
+        • 檢查MA5/MA20糾纏且MA60向上
         回傳最後一週的 (Close, MA_5, MA_20, MA_60)，或空 Series
         """
         try:
@@ -128,36 +115,48 @@ class Stock:
             
             prior = weekly.iloc[-20:-4]
 
-            # 5) 分別計算這段週期的最高盤中價、最低盤中價
-            max_c = round(prior['High'].max().item(), 2)
-            min_c = round(prior['Low'].min().item(), 2)
-
-            # 6) 取得本週收盤價和移動平均線
-            curr_row = weekly.iloc[-1]
-            curr_c = round(curr_row['Close'].item(), 2)
-
-            logging.info(f"{ticker} 5~20 週最高：{max_c}，最低：{min_c}，本週收盤：{curr_c}")
-            
-            # 5) 判斷本週收盤是否在區間內
-            cond_a = (min_c <= curr_c) & (curr_c <= max_c)
-
-            # 6) 突破拉回模式檢查
-            arr_low  = prior['Low'].values
+            # 5) 找出區間內的最高點和最低點的位置
+            arr_low = prior['Low'].values
             arr_high = prior['High'].values
             
             if len(arr_low) < 2:
                 logging.warning(f"{ticker} prior 數據不足")
                 return pd.Series()
-                
-            trough = arr_low.argmin()
-            peak = trough + arr_high[trough:].argmax()
-            cond_b = (0 <= trough < peak < len(arr_low)-1)
+            
+            # 找出最低點和最高點的位置
+            trough_pos = arr_low.argmin()  # 最低點位置
+            peak_pos = arr_high.argmax()   # 最高點位置
+            
+            # 取得實際的高低點數值
+            max_c = round(prior['High'].max().item(), 2)
+            min_c = round(prior['Low'].min().item(), 2)
 
-            # 7) 均線糾纏檢查
-            mas = curr_row[['MA_5','MA_20','MA_60']]
-            cond_c = (mas.max() - mas.min()) / mas.mean() < pct_threshold
+            # 6) 取得本週收盤價
+            curr_row = weekly.iloc[-1]
+            curr_c = round(curr_row['Close'].item(), 2)
 
-            logging.info(f"{symbol} 條件檢查: 區間內={cond_a}, 突破拉回={cond_b}, 均線糾纏={cond_c}")
+            logging.info(f"{ticker} 5~20週 最低點位置:{trough_pos}, 最高點位置:{peak_pos}")
+            logging.info(f"{ticker} 5~20週 最高：{max_c:.2f}，最低：{min_c:.2f}，本週收盤：{curr_c:.2f}")
+            
+            # 檢查突破拉回模式：先有低點，後有高點，且現在收盤價在高低點之間
+            cond_a = trough_pos < peak_pos  # 低點在高點之前
+            cond_b = (min_c <= curr_c <= max_c)  # 現在收盤價在高低點區間內
+
+            # 7) 均線條件檢查
+            # MA5 和 MA20 糾纏
+            ma5_ma20_entangle = (abs(curr_row['MA_5'] - curr_row['MA_20']) / curr_row['MA_20'] < pct_threshold)
+            
+            # MA60 向上（與前一週比較）
+            if len(weekly) < 2:
+                ma60_up = False
+            else:
+                prev_ma60 = weekly.iloc[-2]['MA_60']
+                ma60_up = (curr_row['MA_60'] > prev_ma60)
+            
+            cond_c = ma5_ma20_entangle & ma60_up
+
+            # logging.info(f"{symbol} 條件檢查: 低點在前={cond_a}, 收盤在區間內={cond_b}")
+            # logging.info(f"{symbol} 均線檢查: MA5/MA20糾纏={ma5_ma20_entangle}, MA60向上={ma60_up}, 綜合={cond_c}")
 
             if (cond_a & cond_b & cond_c).all():
                 return curr_row[['Close','MA_5','MA_20','MA_60']]
@@ -169,21 +168,28 @@ class Stock:
         
 if __name__ == '__main__':
     stock = Stock()
-    # codes = stock.get_stock_list()
-    # logging.info(f"總共 {len(codes)} 檔股票將進行篩選")
+    codes = stock.get_stock_list()
+    logging.info(f"總共 {len(codes)} 檔股票將進行篩選")
 
-    # # 1. 月線初篩
-    # monthly_pass = []
-    # for c in codes:
-    #     res = stock.get_monthly_selection(c)
-    #     if not res.empty:
-    #         monthly_pass.append(c)
-    # logging.info(f"月線通過({len(monthly_pass)})：{monthly_pass}")
-    monthly_pass = ['1216', '1612', '2010', '2247', '2364', '2379', '2412', '2423', '2439', '2451', '2493', '2607', '2801', '2820', '2834', '2836', '2886', '2890', '2892', '3028', '3030', '3052', '3231', '3535', '4114', '4129', '4198', '4760', '5274', '5490', '5601', '6177', '6669', '8038', '8358', '8422', '8424', '9902', '9911']
+    # 1. 月線初篩
+    monthly_pass = []
+    for c in codes:
+        res = stock.get_monthly_selection(c)
+        if not res.empty:
+            monthly_pass.append(c)
+    logging.info(f"月線通過({len(monthly_pass)})：{monthly_pass}")
+    
+    # monthly_pass = ['1216', '1612', '2010', '2247', '2364', '2379', '2412', '2423', '2439', '2451', '2493', '2607', '2801', '2820', '2834', '2836', '2886', '2890', '2892', '3028', '3030', '3052', '3231', '3535', '4114', '4129', '4198', '4760', '5274', '5490', '5601', '6177', '6669', '8038', '8358', '8422', '8424', '9902', '9911']
+    
     # 2. 週線複篩
     final_pass = []
     for c in monthly_pass:
+        logging.info(f"正在處理 {c}...")
         res = stock.get_weekly_selection(c)
         if not res.empty:
             final_pass.append(c)
+            logging.info(f"{c} 通過週線篩選: {res.to_dict()}")
+        else:
+            logging.info(f"{c} 未通過週線篩選")
+    
     logging.info(f"最終符合({len(final_pass)})：{final_pass}")
