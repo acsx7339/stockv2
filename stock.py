@@ -1,173 +1,243 @@
-import twstock
-import yfinance as yf
-import pandas as pd
 import logging
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import twstock
+from typing import List, Optional
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-class Stock:
+
+class TaiwanStockScanner:
+    """台股技術面選股器"""
+    
     def __init__(self):
         self.twse_list = set(twstock.twse.keys())
         self.tpex_list = set(twstock.tpex.keys())
+        
+        # 突破拉回策略參數
+        self.params = {
+            'breakout_volume_mult': 2.0,    # 突破量倍數
+            'breakout_window': 20,          # 突破高點回看天數
+            'pullback_days': 13,            # 拉回觀察天數
+            'ma_support': 20,               # 均線支撐
+            'atr_limit': 0.04,              # ATR限制（4%）
+        }
 
-    def get_stock_list(self) -> list:
+    def get_stock_codes(self) -> List[str]:
+        """取得所有4位數股票代碼（排除0開頭）"""
         all_codes = self.twse_list | self.tpex_list
-        filtered = [c for c in all_codes if len(c) == 4 and c[0] != '0']
-        return sorted(filtered)
+        return sorted([code for code in all_codes 
+                      if len(code) == 4 and not code.startswith('0')])
 
-    def _get_ticker(self, symbol: str) -> str:
-        if symbol in self.twse_list:
-            return f"{symbol}.TW"
-        elif symbol in self.tpex_list:
-            return f"{symbol}.TWO"
+    def _get_ticker(self, code: str) -> str:
+        """轉換為yfinance ticker格式"""
+        if code in self.twse_list:
+            return f"{code}.TW"
+        elif code in self.tpex_list:
+            return f"{code}.TWO"
         else:
-            raise ValueError(f"{symbol} 不在上市或上櫃清單中。")
+            raise ValueError(f"股票代碼 {code} 不在上市/上櫃清單中")
 
-    def get_monthly_selection(self, symbol: str) -> pd.Series:
-        """
-        月線篩選：
-        • 計算月末收盤、最高、最低
-        • MA5/MA20多頭排列
-        • 近100月收盤相對位置低於70%
-        """
-        ticker = self._get_ticker(symbol)
-        df = yf.download(ticker, period='10y', interval='1d', auto_adjust=False, progress=False)
-        if df.empty:
-            return pd.Series()
-
-        # 取每月數據
-        monthly_close = df['Close'].resample('ME').last()
-        monthly_high  = df['High'].resample('ME').max()
-        monthly_low   = df['Low'].resample('ME').min()
-        monthly = pd.concat([monthly_close, monthly_high, monthly_low],
-                            axis=1, keys=['Close', 'High', 'Low']).dropna()
-
-        # 計算MA
-        monthly['MA_5']  = monthly['Close'].rolling(5).mean()
-        monthly['MA_20'] = monthly['Close'].rolling(20).mean()
-        monthly.dropna(inplace=True)
-        if len(monthly) < 2:
-            return pd.Series()
-
-        prev, last = monthly.iloc[-2], monthly.iloc[-1]
-        cond1 = (last['MA_5'].item() > prev['MA_5'].item())
-        cond2 = (last['MA_20'].item() > prev['MA_20'].item())
-        cond3 = (last['MA_5'].item() > last['MA_20'].item())
-        print(f"last 5 {last['MA_5'].item()}, last 20 {last['MA_20'].item()}")
-        ratio = (last['MA_5'] / last['MA_20']).item()
-        cond4 = 1 < ratio <= 1.04
-        # 近100月相對位置
-        lookback_months = min(100, len(monthly))
-        recent = monthly.iloc[-lookback_months:]
-        max_price = recent['High'].max().item()
-        min_price = recent['Low'].min().item()
-        current_close = last['Close'].item()
-        # 避免除零錯誤
-        if max_price != min_price:
-            relative_position = (current_close - min_price) / (max_price - min_price)
-            cond5 = relative_position < 0.7
-            relative_pct = relative_position * 100
-        else:
-            cond5 = False
-            relative_pct = 0
-
-        logging.info(f"{ticker} 月線篩選: MA5↑{cond1}, MA20↑{cond2}, MA5>MA20{cond3}, MA距離是否接近{cond4}, 相對位置{ratio:.2f}%，PL<70%:{cond5}")
-
-        if cond1 and cond2 and cond3 and cond4 and cond5:
-            return last[['Close', 'MA_5', 'MA_20']]
-        return pd.Series()
-
-    def get_weekly_selection(self,
-                             symbol: str,
-                             lookback_weeks: int = 20,
-                             pct_threshold: float = 0.03
-                            ) -> pd.Series:
-        """
-        週線篩選：
-        • MA5/MA20/MA60計算
-        • 5~20週先低點後高點，現收盤於區間內
-        • MA5/MA20糾纏，MA60向上
-        """
+    def _download_data(self, code: str, period: str = "1y") -> Optional[pd.DataFrame]:
+        """下載股價資料並處理MultiIndex問題"""
         try:
-            ticker = self._get_ticker(symbol)
-            df = yf.download(ticker, period='2y', interval='1d',
-                             auto_adjust=False, progress=False)
+            ticker = self._get_ticker(code)
+            df = yf.download(ticker, period=period, interval='1d', auto_adjust=False, progress=False)
+            
             if df.empty:
-                return pd.Series()
-
-            weekly_close = df['Close'].resample('W-FRI').last()
-            weekly_low   = df['Low'].resample('W-FRI').min()
-            weekly_high  = df['High'].resample('W-FRI').max()
-            weekly = pd.concat(
-                [weekly_close, weekly_low, weekly_high],
-                axis=1, keys=['Close','Low','High']
-            ).dropna()
-
-            weekly['MA_5']  = weekly['Close'].rolling(window=5).mean()
-            weekly['MA_20'] = weekly['Close'].rolling(window=20).mean()
-            weekly['MA_60'] = weekly['Close'].rolling(window=60).mean()
-            weekly.dropna(inplace=True)
-
-            if len(weekly) < 21:
-                return pd.Series()
-
-            prior    = weekly.iloc[-21:-1]
-            curr_row = weekly.iloc[-1]
-
-            arr_low = prior['Low'].values
-            arr_high = prior['High'].values
-            trough_pos = arr_low.argmin()
-            peak_pos   = arr_high.argmax()
-            min_c = float(prior['Low'].min())
-            max_c = float(prior['High'].max())
-            curr_c = float(curr_row['Close'])
-
-            cond_a = trough_pos < peak_pos
-            cond_b = (min_c <= curr_c <= max_c)
-
-            ma5 = weekly['MA_5'].iat[-1]
-            ma20 = weekly['MA_20'].iat[-1]
-            ratio = abs(ma5 - ma20) / ma20
-            ma5_ma20_entangle = ratio < pct_threshold
-
-            prev_ma60 = weekly['MA_60'].iat[-2]
-            curr_ma60 = weekly['MA_60'].iat[-1]
-            ma60_up = curr_ma60 > prev_ma60
-
-            passed = cond_a and cond_b and ma5_ma20_entangle and ma60_up
-
-            # 統一乾淨log
-            logging.info(f"{ticker} 週線: 低點前:{cond_a}, 收盤區:{cond_b}, MA5/MA20糾纏:{ma5_ma20_entangle}, MA60上:{ma60_up}, 通過:{passed}")
-
-            if passed:
-                return curr_row[['Close', 'MA_5', 'MA_20', 'MA_60']]
-            return pd.Series()
-
+                return None
+                
+            # 修正MultiIndex columns問題
+            if isinstance(df.columns, pd.MultiIndex):
+                # 如果是MultiIndex，取第一層級作為列名
+                df.columns = df.columns.get_level_values(0)
+            
+            return df
+            
         except Exception as e:
-            logging.error(f"{symbol} 處理時發生錯誤: {e}")
-            return pd.Series()
+            logging.warning(f"下載 {code} 資料失敗: {e}")
+            return None
 
-if __name__ == '__main__':
-    stock = Stock()
-    codes = stock.get_stock_list()
-    logging.info(f"總共 {len(codes)} 檔股票將進行篩選")
+    def monthly_filter(self, code: str) -> bool:
+        """月線趨勢篩選"""
+        df = self._download_data(code, period="2y")
+        if df is None:
+            return False
+            
+        try:
+           # ─── 取月線資料（修正版） ───
+            close_s = df['Close'].resample('ME').last()
+            high_s  = df['High'].resample('ME').max()
+            low_s   = df['Low'].resample('ME').min()
 
-    # 1. 月線初篩
-    monthly_pass = []
-    for c in codes:
-        res = stock.get_monthly_selection(c)
-        if not res.empty:
-            monthly_pass.append(c)
-    logging.info(f"月線通過({len(monthly_pass)})：{monthly_pass}")
+            monthly = pd.concat([close_s, high_s, low_s], axis=1)
+            monthly.columns = ['Close', 'High', 'Low']
+            monthly.dropna(inplace=True)
 
-    # 2. 週線複篩
-    final_pass = []
-    for c in monthly_pass:
-        res = stock.get_weekly_selection(c)
-        if not res.empty:
-            final_pass.append(c)
-            logging.info(f"{c} 通過週線篩選: {res.to_dict()}")
-        else:
-            logging.info(f"{c} 未通過週線篩選")
+            
+            if len(monthly) < 25:  # 至少需要25個月資料
+                return False
+                
+            # 計算月均線
+            monthly['MA5'] = monthly['Close'].rolling(5).mean()
+            monthly['MA20'] = monthly['Close'].rolling(20).mean()
+            monthly.dropna(inplace=True)
+            
+            if len(monthly) < 2:
+                return False
+                
+            current = monthly.iloc[-1]
+            prev = monthly.iloc[-2]
+            
+            # 月線篩選條件
+            conditions = [
+                current['MA5'] > prev['MA5'],           # 月MA5上升
+                current['MA20'] > prev['MA20'],         # 月MA20上升  
+                current['MA5'] > current['MA20'],       # MA5在MA20之上
+                1 < current['MA5'] / current['MA20'] <= 1.04,  # 均線糾結
+            ]
+            ratio = current['MA5'] / current['MA20']
+            # **加這段 logging**，把數值和結果都印出來
+            logging.info(
+                f"{code} 月線條件檢查："
+                f"MA5_prev={prev['MA5']:.2f}, MA5_curr={current['MA5']:.2f}; "
+                f"MA20_prev={prev['MA20']:.2f}, MA20_curr={current['MA20']:.2f}; "
+                f"MA5>MA20=({current['MA5']} > {current['MA20']}); "
+                f"ratio={ratio:.4f}"
+            )
 
-    logging.info(f"最終符合({len(final_pass)})：{final_pass}")
+            # 股價位置（近100天）
+            recent_high = monthly['High'].tail(20).max()
+            recent_low = monthly['Low'].tail(20).min()
+            price_position = (current['Close'] - recent_low) / (recent_high - recent_low)
+            conditions.append(price_position < 0.7)  # 不在高檔
+            
+            return all(conditions)
+            
+        except Exception as e:
+            logging.warning(f"{code} 月線篩選失敗: {e}")
+            return False
+
+    def breakout_pullback_filter(self, code: str) -> bool:
+        """突破拉回型態篩選"""
+        df = self._download_data(code, period="6mo")
+        if df is None or len(df) < 60:
+            return False
+            
+        try:            
+            # 計算技術指標
+            df['MA20'] = df['Close'].rolling(20).mean()
+            df['Volume_MA'] = df['Volume'].rolling(self.params['breakout_window']).mean()
+            df['High_Max'] = df['High'].shift(1).rolling(self.params['breakout_window']).max()
+            
+            # ATR計算
+            df['TR'] = np.maximum(
+                df['High'] - df['Low'],
+                np.maximum(
+                    abs(df['High'] - df['Close'].shift(1)),
+                    abs(df['Low'] - df['Close'].shift(1))
+                )
+            )
+            df['ATR'] = df['TR'].rolling(14).mean()
+            
+            # 移除缺失值
+            df.dropna(subset=['High', 'High_Max', 'Volume', 'Volume_MA'], inplace=True)            
+            if len(df) < 30:
+                return False
+            
+            # 尋找突破點
+            breakout_mask = (
+                (df['High'] > df['High_Max']) & 
+                (df['Volume'] > self.params['breakout_volume_mult'] * df['Volume_MA'])
+            )
+            
+            if not breakout_mask.any():
+                return False
+                
+            # 最近突破日期
+            breakout_indices = df[breakout_mask].index
+            last_breakout = breakout_indices[-1]
+            
+            # 檢查拉回條件（最近幾天）
+            recent_days = min(self.params['pullback_days'], len(df) - df.index.get_loc(last_breakout) - 1)
+            if recent_days <= 0:
+                return False
+                
+            current = df.iloc[-1]
+            breakout_data = df.loc[last_breakout]
+            
+            # 拉回條件檢查
+            days_since_breakout = len(df) - df.index.get_loc(last_breakout) - 1
+            
+            pullback_conditions = [
+                34 <= days_since_breakout,  # 至少拉回六週起跳
+                current['Close'] < breakout_data['High_Max'],                  # 收盤回落
+                current['Close'] < breakout_data['High_Max'],              # 拉回中
+                # current['Volume'] < current['Volume_MA'],                   # 量縮
+                current['Low'] >= current['MA20'],# 守住MA20
+                (current['ATR'] / current['Close']) <= self.params['atr_limit'],  # 波動可控
+            ]
+            
+            logging.info(f"{code} 突破拉回條件檢查: {pullback_conditions}")
+            return all(pullback_conditions)
+            
+        except Exception as e:
+            logging.warning(f"{code} 突破拉回篩選失敗: {e}")
+            return False
+
+    def scan_stocks(self, limit: int = None) -> List[str]:
+        """執行完整選股流程"""
+        codes = self.get_stock_codes()
+        if limit:
+            codes = codes[:limit]
+            
+        logging.info(f"開始篩選 {len(codes)} 檔股票...")
+        
+        # 第一階段：月線篩選
+        logging.info("執行月線篩選...")
+        monthly_passed = []
+        for i, code in enumerate(codes, 1):
+            if i % 100 == 0:
+                logging.info(f"月線篩選進度: {i}/{len(codes)}")
+                
+            if self.monthly_filter(code):
+                monthly_passed.append(code)
+                
+        logging.info(f"月線篩選通過: {len(monthly_passed)} 檔 - {monthly_passed}")
+        # monthly_passed = ['1264', '1321', '1560', '1612', '1618', '2102', '2247', '2365', '2379', '2382', '2402', '2412', '2427', '2493', '2546', '2630', '2836', '3005', '3036', '3059', '3086', '3131', '3149', '3376', '3625', '4129', '4153', '5205', '5292', '5434', '5490', '5523', '6156', '6187', '6201', '6213', '6515', '6561', '8464', '8931', '9902']
+        
+        # 第二階段：突破拉回篩選
+        logging.info("執行突破拉回篩選...")
+        final_candidates = []
+        for code in monthly_passed:
+            if self.breakout_pullback_filter(code):
+                final_candidates.append(code)
+                logging.info(f"{code} 通過突破拉回篩選")
+                
+        return final_candidates
+
+
+def main():
+    """主程式"""
+    scanner = TaiwanStockScanner()
+    
+    # 執行選股（可設定limit測試）
+    candidates = scanner.scan_stocks()  # 測試時限制50檔
+    print(f"item: {candidates}")
+    if candidates:
+        logging.info(f"🎯 最終選股結果 ({len(candidates)} 檔): {candidates}")
+        
+        # 顯示股票名稱
+        for code in candidates:
+            try:
+                stock_name = twstock.codes[code].name if code in twstock.codes else "未知"
+                logging.info(f"  {code} - {stock_name}")
+            except:
+                logging.info(f"  {code} - 無法取得名稱")
+    else:
+        logging.info("本次篩選無符合條件股票")
+
+
+if __name__ == "__main__":
+    main()
