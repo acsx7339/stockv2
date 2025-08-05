@@ -102,9 +102,53 @@ class getStockData():
 
 class monthly_filter():
 
-    df = getStockData._download_historical_data(code, years_back=3)
-    if df is None:
-        return False
+    def history_data(self, code):
+        df = getStockData._download_historical_data(code, years_back=3)
+        if df is None:
+            return False
+        try:
+            # 取月線資料（以目標日期為基準）
+            close_s = df['Close'].resample('ME').last()
+            high_s = df['High'].resample('ME').max()
+            low_s = df['Low'].resample('ME').min()
+
+            monthly = pd.concat([close_s, high_s, low_s], axis=1)
+            monthly.columns = ['Close', 'High', 'Low']
+            monthly.dropna(inplace=True)
+
+            if len(monthly) < 25:  # 至少需要25個月資料
+                return False
+                
+            # 計算月均線
+            monthly['MA5'] = monthly['Close'].rolling(5).mean()
+            monthly['MA20'] = monthly['Close'].rolling(20).mean()
+            monthly.dropna(inplace=True)
+            
+            if len(monthly) < 2:
+                return False
+                
+            # 找到目標日期當月或最接近的月份
+            target_month = self.target_date.to_period('M')
+            
+            # 找到最接近目標日期的月線資料
+            monthly_periods = monthly.index.to_period('M')
+            if target_month not in monthly_periods:
+                # 如果目標月份不存在，找最接近的前一個月
+                available_months = monthly_periods[monthly_periods <= target_month]
+                if len(available_months) == 0:
+                    return False
+                target_month = available_months[-1]
+            
+            # 獲取目標月份的索引
+            target_idx = monthly_periods.get_loc(target_month)
+            if target_idx == 0:  # 如果是第一個月，無法比較前一月
+                return False
+                
+            current = monthly.iloc[target_idx]
+            prev = monthly.iloc[target_idx - 1]
+        except Exception as e:
+            logging.warning(f"{code} 月線篩選失敗: {e}")
+            return False
 
     
     
