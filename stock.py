@@ -353,7 +353,7 @@ def main():
     scanner = TaiwanStockHistoricalScanner(target_date=target_date)
 
     # 可以先測試少量股票
-    picks = scanner.scan_stocks(limit=100)  # 限制前100檔測試
+    picks = scanner.scan_stocks()  # 限制前100檔測試
     
     if picks:
         logging.info(f"最終({len(picks)}): {picks}")
